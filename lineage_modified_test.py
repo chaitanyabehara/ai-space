@@ -8,7 +8,6 @@ from sqlglot import exp
 SQL_STATEMENTS = """
 """
 
-
 def parse_statements(sql: str) -> List[exp.Expression]:
     """Parse SQL statements with Hive dialect"""
     try:
@@ -797,13 +796,203 @@ def generate_lineage(sql: str, target_table: str = None, default_schema: Optiona
     return result
 
 
+def generate_multi_hop_lineage(table_defs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Generate multi-hop lineage data with intermediate tables.
+    Creates a graph structure showing source → intermediate → target flow.
+    """
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    node_ids = set()
+    
+    # Process all tables in the definition
+    processed_tables = set()
+    
+    for table_name, table_def in table_defs.items():
+        processed_tables.add(table_name)
+        
+        # Determine table type
+        is_target = (table_name == "derived_df" or table_name.endswith("_df"))
+        is_intermediate = not is_target and table_def.get("immediate_source_tables")
+        
+        # Add table node
+        table_node = {
+            "id": table_name,
+            "label": table_name,
+            "type": "table",
+            "parent_id": None
+        }
+        if table_node["id"] not in node_ids:
+            nodes.append(table_node)
+            node_ids.add(table_node["id"])
+        
+        # Add column nodes for this table
+        col_lineage = table_def.get("column_lineage", {})
+        for col_name in col_lineage.keys():
+            if col_name == "*":
+                continue
+            if not is_valid_column_name(col_name):
+                continue
+            
+            col_id = f"{table_name}.{col_name}"
+            col_node = {
+                "id": col_id,
+                "label": col_name,
+                "type": "column",
+                "parent_id": table_name
+            }
+            if col_node["id"] not in node_ids:
+                nodes.append(col_node)
+                node_ids.add(col_node["id"])
+    
+    # Add base source tables (those not defined in table_defs)
+    all_source_tables = set()
+    for table_def in table_defs.values():
+        all_source_tables.update(table_def.get("source_tables", []))
+    
+    for src_table in all_source_tables:
+        if src_table not in processed_tables:
+            table_node = {
+                "id": src_table,
+                "label": src_table,
+                "type": "table",
+                "parent_id": None
+            }
+            if table_node["id"] not in node_ids:
+                nodes.append(table_node)
+                node_ids.add(table_node["id"])
+    
+    # Create table-level edges
+    for table_name, table_def in table_defs.items():
+        for src_table in table_def.get("immediate_source_tables", []):
+            edge = {
+                "source": src_table,
+                "target": table_name,
+                "flow_type": "table_level"
+            }
+            edges.append(edge)
+    
+    # Create column-level edges by resolving lineage
+    for target_table, table_def in table_defs.items():
+        col_lineage = table_def.get("column_lineage", {})
+        
+        for tgt_col, src_list in col_lineage.items():
+            if tgt_col == "*" or not is_valid_column_name(tgt_col):
+                continue
+            
+            target_col_id = f"{target_table}.{tgt_col}"
+            
+            for src_entry in src_list:
+                # Handle direct column references
+                if src_entry.get("source_table") and src_entry.get("source_column"):
+                    src_table = src_entry["source_table"]
+                    src_col = src_entry["source_column"]
+                    
+                    # If source is an intermediate table, trace to base
+                    if src_table in table_defs:
+                        bases = resolve_to_base_columns(table_defs, src_table, src_col)
+                        for base_table, base_col in bases:
+                            if base_col and is_valid_column_name(base_col):
+                                source_col_id = f"{base_table}.{base_col}"
+                                edge = {
+                                    "source": source_col_id,
+                                    "target": target_col_id,
+                                    "flow_type": "column_level",
+                                    "logic": "Direct Pass-Through"
+                                }
+                                edges.append(edge)
+                    else:
+                        # Direct base table reference
+                        if src_col and is_valid_column_name(src_col):
+                            source_col_id = f"{src_table}.{src_col}"
+                            edge = {
+                                "source": source_col_id,
+                                "target": target_col_id,
+                                "flow_type": "column_level",
+                                "logic": "Direct Pass-Through"
+                            }
+                            edges.append(edge)
+                
+                # Handle expressions
+                elif src_entry.get("source_expression"):
+                    expr = src_entry["source_expression"]
+                    if expr != "*":
+                        origin_map = src_entry.get("origin_map") or table_def.get("source_map", {})
+                        refs = extract_columns_from_expression(expr)
+                        
+                        for alias, col_name in refs:
+                            if not col_name or not is_valid_column_name(col_name):
+                                continue
+                            
+                            if alias:
+                                src_table = origin_map.get(alias) or alias
+                            else:
+                                vals = list(origin_map.values())
+                                src_table = vals[0] if len(vals) == 1 else None
+                            
+                            if src_table:
+                                if src_table in table_defs:
+                                    bases = resolve_to_base_columns(table_defs, src_table, col_name)
+                                    for base_table, base_col in bases:
+                                        if base_col and is_valid_column_name(base_col):
+                                            source_col_id = f"{base_table}.{base_col}"
+                                            edge = {
+                                                "source": source_col_id,
+                                                "target": target_col_id,
+                                                "flow_type": "column_level",
+                                                "logic": expr[:150]  # Truncate long expressions
+                                            }
+                                            edges.append(edge)
+                                else:
+                                    if col_name and is_valid_column_name(col_name):
+                                        source_col_id = f"{src_table}.{col_name}"
+                                        edge = {
+                                            "source": source_col_id,
+                                            "target": target_col_id,
+                                            "flow_type": "column_level",
+                                            "logic": expr[:150]
+                                        }
+                                        edges.append(edge)
+    
+    # Remove duplicate edges
+    unique_edges = []
+    seen_edges = set()
+    for edge in edges:
+        edge_key = (edge["source"], edge["target"], edge.get("logic", ""))
+        if edge_key not in seen_edges:
+            unique_edges.append(edge)
+            seen_edges.add(edge_key)
+    
+    return {
+        "nodes": nodes,
+        "edges": unique_edges
+    }
+
+
 def main():
+    # Generate direct column lineage
     result = generate_lineage(SQL_STATEMENTS, default_schema=None)
     
     with open("C:\\Users\\ADMIN\\Desktop\\AI\\hack\\modify_data.json", "w") as f:
         json.dump(result, f, indent=4)
     
-    print("Lineage data written to modify_data.json")
+    print("Direct column lineage written to modify_data.json")
+    
+    # Generate multi-hop lineage with intermediate tables
+    expressions = parse_statements(SQL_STATEMENTS)
+    if expressions:
+        table_defs = build_table_defs(expressions)
+        if table_defs:
+            multi_hop_result = generate_multi_hop_lineage(table_defs)
+            
+            with open("C:\\Users\\ADMIN\\Desktop\\AI\\hack\\lineage_data.json", "w") as f:
+                json.dump(multi_hop_result, f, indent=4)
+            
+            print("Multi-hop lineage with intermediate tables written to lineage_data.json")
+        else:
+            print("Warning: Could not build table definitions for multi-hop lineage")
+    else:
+        print("Warning: Could not parse SQL statements for multi-hop lineage")
 
 
 if __name__ == "__main__":
