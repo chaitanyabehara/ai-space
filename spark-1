@@ -1,0 +1,264 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import math
+
+# ==========================================================
+# START SPARK
+# ==========================================================
+
+spark = SparkSession.builder \
+    .appName("Spark Query Feature Extractor") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+
+# ==========================================================
+# LOAD EVENT LOG
+# ==========================================================
+
+import sys
+event_log_path = sys.argv[1]
+
+raw = spark.read.json(event_log_path)
+
+# ==========================================================
+# QUERY METADATA
+# ==========================================================
+
+app_info = raw.filter(col("Event") == "SparkListenerApplicationStart") \
+    .select(
+        col("App ID").alias("application_id"),
+        col("Timestamp").alias("start_time"),
+        col("Spark Version").alias("spark_version")
+    ).limit(1)
+
+sql_exec = raw.filter(col("Event") == "SparkListenerSQLExecutionStart")
+
+query_meta = sql_exec.select(
+    col("executionId").alias("execution_id"),
+    sha2(col("description"), 256).alias("query_text_hash"),
+    col("time").alias("start_time")
+)
+
+# ==========================================================
+# CONFIG EXTRACTION
+# ==========================================================
+
+env = raw.filter(col("Event") == "SparkListenerEnvironmentUpdate")
+
+conf_map = env.selectExpr("explode(Spark Properties) as kv") \
+    .select(col("kv._1").alias("key"), col("kv._2").alias("value"))
+
+def get_conf(key):
+    return conf_map.filter(col("key") == key).select("value").limit(1)
+
+aqe_enabled = get_conf("spark.sql.adaptive.enabled")
+shuffle_partitions = get_conf("spark.sql.shuffle.partitions")
+executor_memory = get_conf("spark.executor.memory")
+executor_cores = get_conf("spark.executor.cores")
+
+# ==========================================================
+# STAGE METRICS
+# ==========================================================
+
+stages = raw.filter(col("Event") == "SparkListenerStageCompleted") \
+    .select(
+        col("Stage Info.Stage ID").alias("stage_id"),
+        col("Stage Info.Name").alias("stage_name"),
+        col("Stage Info.Num Tasks").alias("num_tasks"),
+        col("Stage Info.Submission Time").alias("submission_time"),
+        col("Stage Info.Completion Time").alias("completion_time")
+    ) \
+    .withColumn("stage_time",
+        col("completion_time") - col("submission_time")
+    )
+
+stage_agg = stages.agg(
+    count("*").alias("num_stages"),
+    max("stage_time").alias("longest_stage_time"),
+    avg("num_tasks").alias("avg_tasks_per_stage"),
+    max("num_tasks").alias("max_parallel_tasks")
+)
+
+# ==========================================================
+# TASK METRICS
+# ==========================================================
+
+tasks = raw.filter(col("Event") == "SparkListenerTaskEnd") \
+    .select(
+        col("Task Info.Task ID").alias("task_id"),
+        col("Task Info.Executor ID").alias("executor_id"),
+        col("Task Info.Finish Time").alias("finish_time"),
+        col("Task Info.Launch Time").alias("launch_time"),
+        col("Task Metrics.Executor Run Time").alias("executor_runtime"),
+        col("Task Metrics.Executor CPU Time").alias("executor_cpu_time"),
+        col("Task Metrics.Memory Bytes Spilled").alias("memory_spill"),
+        col("Task Metrics.Disk Bytes Spilled").alias("disk_spill"),
+        col("Task Metrics.Input Metrics.Bytes Read").alias("input_bytes"),
+        col("Task Metrics.Shuffle Read Metrics.Total Bytes Read").alias("shuffle_read_bytes"),
+        col("Task Metrics.Shuffle Write Metrics.Shuffle Bytes Written").alias("shuffle_write_bytes")
+    ) \
+    .withColumn("task_runtime",
+        col("finish_time") - col("launch_time")
+    )
+
+task_agg = tasks.agg(
+    sum("input_bytes").alias("total_input_bytes"),
+    sum("shuffle_read_bytes").alias("total_shuffle_read_bytes"),
+    sum("shuffle_write_bytes").alias("total_shuffle_write_bytes"),
+    sum("memory_spill").alias("total_spill_memory_bytes"),
+    sum("disk_spill").alias("total_spill_disk_bytes"),
+    sum("executor_runtime").alias("total_executor_runtime"),
+    sum("executor_cpu_time").alias("total_executor_cpu_time"),
+    avg("task_runtime").alias("task_runtime_mean"),
+    stddev("task_runtime").alias("task_runtime_stddev"),
+    max("task_runtime").alias("task_runtime_max"),
+    min("task_runtime").alias("task_runtime_min"),
+    expr("percentile(task_runtime, 0.95)").alias("task_runtime_p95"),
+    expr("percentile(task_runtime, 0.99)").alias("task_runtime_p99"),
+    expr("percentile(task_runtime, 0.5)").alias("task_runtime_median")
+)
+
+# ==========================================================
+# DERIVED METRICS
+# ==========================================================
+
+features = task_agg.crossJoin(stage_agg)
+
+features = features.withColumn(
+    "spill_ratio",
+    col("total_spill_memory_bytes") /
+    (col("total_shuffle_write_bytes") + lit(1))
+)
+
+features = features.withColumn(
+    "cpu_efficiency",
+    col("total_executor_cpu_time") /
+    (col("total_executor_runtime") + lit(1))
+)
+
+features = features.withColumn(
+    "runtime_skew_ratio",
+    col("task_runtime_max") /
+    (col("task_runtime_median") + lit(1))
+)
+
+features = features.withColumn(
+    "p99_to_median_ratio",
+    col("task_runtime_p99") /
+    (col("task_runtime_median") + lit(1))
+)
+
+# ==========================================================
+# GINI COEFFICIENT FOR RUNTIME
+# ==========================================================
+
+runtime_values = tasks.select("task_runtime") \
+    .rdd.map(lambda x: x[0]).collect()
+
+def gini(values):
+    if not values:
+        return 0
+    values = sorted(values)
+    n = len(values)
+    cumulative = 0
+    for i, val in enumerate(values):
+        cumulative += (i + 1) * val
+    return (2 * cumulative) / (n * sum(values)) - (n + 1) / n
+
+gini_runtime = gini(runtime_values)
+
+features = features.withColumn("gini_coefficient_runtime", lit(gini_runtime))
+
+# ==========================================================
+# SHUFFLE DEEP FEATURES
+# ==========================================================
+
+partition_sizes = tasks.select("shuffle_read_bytes") \
+    .rdd.map(lambda x: x[0] if x[0] else 0).collect()
+
+if partition_sizes:
+    max_p = max(partition_sizes)
+    min_p = min(partition_sizes)
+    median_p = sorted(partition_sizes)[len(partition_sizes)//2]
+    std_p = float(spark.sparkContext.parallelize(partition_sizes).stdev())
+else:
+    max_p = min_p = median_p = std_p = 0
+
+features = features \
+    .withColumn("max_partition_size_mb", lit(max_p / 1024 / 1024)) \
+    .withColumn("min_partition_size_mb", lit(min_p / 1024 / 1024)) \
+    .withColumn("median_partition_size_mb", lit(median_p / 1024 / 1024)) \
+    .withColumn("partition_size_stddev", lit(std_p)) \
+    .withColumn("partition_skew_ratio",
+        lit(max_p / (median_p + 1))
+    )
+
+# ==========================================================
+# CARDINALITY ERROR (PLAN LEVEL)
+# ==========================================================
+
+plan_nodes = sql_exec.selectExpr("explode(sparkPlanInfo.children) as node")
+
+cardinality_df = plan_nodes.select(
+    col("node.nodeName").alias("node_name"),
+    col("node.statistics.rowCount").alias("estimated_rows")
+)
+
+# Actual rows from metrics
+actual_rows_df = raw.filter(col("Event") == "SparkListenerTaskEnd") \
+    .select(sum("Task Metrics.Output Metrics.Records Written")
+            .alias("actual_output_rows"))
+
+cardinality_error = cardinality_df.crossJoin(actual_rows_df)
+
+cardinality_error = cardinality_error.withColumn(
+    "cardinality_error_ratio",
+    col("actual_output_rows") /
+    (col("estimated_rows") + lit(1))
+)
+
+cardinality_error = cardinality_error.withColumn(
+    "log_cardinality_error",
+    log10(col("cardinality_error_ratio") + lit(1))
+)
+
+cardinality_error = cardinality_error.withColumn(
+    "statistics_issue_flag",
+    when(col("cardinality_error_ratio") > 10, lit(True)).otherwise(lit(False))
+)
+
+# ==========================================================
+# RISK SCORES
+# ==========================================================
+
+features = features \
+    .withColumn("shuffle_risk_score",
+        col("partition_skew_ratio") * col("spill_ratio")
+    ) \
+    .withColumn("skew_severity_score",
+        col("runtime_skew_ratio") * col("gini_coefficient_runtime")
+    ) \
+    .withColumn("memory_risk_score",
+        col("spill_ratio") * 2
+    ) \
+    .withColumn("overall_health_score",
+        0.25 * col("shuffle_risk_score") +
+        0.25 * col("skew_severity_score") +
+        0.25 * col("memory_risk_score") +
+        0.25 * col("cpu_efficiency")
+    )
+
+# ==========================================================
+# FINAL OUTPUT
+# ==========================================================
+
+final_df = features.crossJoin(cardinality_error)
+
+final_df.show(truncate=False)
+
+# Save features
+final_df.write.mode("overwrite").parquet("query_features_output")
+
+spark.stop()
