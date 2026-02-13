@@ -1,0 +1,224 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import sys
+import math
+
+spark = SparkSession.builder \
+    .appName("Enterprise Spark Query Feature Extractor") \
+    .getOrCreate()
+
+spark.sparkContext.setLogLevel("ERROR")
+
+event_log_path = sys.argv[1]
+
+# ==========================================================
+# LOAD EVENT LOG
+# ==========================================================
+
+raw = spark.read.json(event_log_path)
+
+# ==========================================================
+# ENV + CONFIG
+# ==========================================================
+
+env = raw.filter(col("Event") == "SparkListenerEnvironmentUpdate")
+
+conf = env.selectExpr("explode(Spark Properties) as kv") \
+    .select(col("kv._1").alias("key"), col("kv._2").alias("value"))
+
+def get_conf_value(key):
+    df = conf.filter(col("key") == key).select("value").limit(1).collect()
+    return df[0][0] if df else None
+
+aqe_enabled_global = get_conf_value("spark.sql.adaptive.enabled")
+
+# ==========================================================
+# MULTI-QUERY SUPPORT
+# ==========================================================
+
+sql_start = raw.filter(col("Event") == "SparkListenerSQLExecutionStart") \
+    .select(
+        col("executionId"),
+        col("description").alias("query_text"),
+        col("time").alias("start_time"),
+        col("sparkPlanInfo"),
+        col("physicalPlanDescription")
+    )
+
+sql_end = raw.filter(col("Event") == "SparkListenerSQLExecutionEnd") \
+    .select(
+        col("executionId"),
+        col("time").alias("end_time")
+    )
+
+queries = sql_start.join(sql_end, "executionId", "left") \
+    .withColumn("execution_time_ms", col("end_time") - col("start_time"))
+
+# ==========================================================
+# LOGICAL PLAN PARSING
+# ==========================================================
+
+def count_pattern(text, pattern):
+    if text is None:
+        return 0
+    return text.count(pattern)
+
+count_udf = udf(lambda x: count_pattern(x, "UDF"), IntegerType())
+count_cte = udf(lambda x: count_pattern(x, "With"), IntegerType())
+count_subquery = udf(lambda x: count_pattern(x, "Subquery"), IntegerType())
+count_join = udf(lambda x: count_pattern(x, "Join"), IntegerType())
+count_case = udf(lambda x: count_pattern(x, "CASE"), IntegerType())
+
+queries = queries \
+    .withColumn("num_udf", count_udf(col("query_text"))) \
+    .withColumn("num_cte", count_cte(col("query_text"))) \
+    .withColumn("num_subqueries", count_subquery(col("query_text"))) \
+    .withColumn("num_joins", count_join(col("query_text"))) \
+    .withColumn("num_case_when", count_case(col("query_text")))
+
+# ==========================================================
+# AQE DETECTION
+# ==========================================================
+
+queries = queries.withColumn(
+    "aqe_enabled",
+    when(lit(aqe_enabled_global) == "true", lit(True)).otherwise(lit(False))
+)
+
+# AQE plan updated count
+aqe_updates = raw.filter(col("Event") == "SparkListenerSQLAdaptiveExecutionUpdate") \
+    .groupBy("executionId") \
+    .agg(count("*").alias("aqe_plan_updated_count"))
+
+queries = queries.join(aqe_updates, "executionId", "left") \
+    .fillna({"aqe_plan_updated_count": 0})
+
+# ==========================================================
+# JOIN STRATEGY CHANGE DETECTION
+# ==========================================================
+
+def detect_join_strategy_change(plan_text):
+    if plan_text is None:
+        return False
+    return ("SortMergeJoin" in plan_text and "BroadcastHashJoin" in plan_text)
+
+join_change_udf = udf(detect_join_strategy_change, BooleanType())
+
+queries = queries.withColumn(
+    "join_strategy_changed",
+    join_change_udf(col("physicalPlanDescription"))
+)
+
+# ==========================================================
+# SKEW JOIN DETECTION
+# ==========================================================
+
+skew_join_flag = raw.filter(col("Event") == "SparkListenerSQLAdaptiveExecutionUpdate") \
+    .select("executionId", "sparkPlanInfo") \
+    .withColumn(
+        "skew_join_optimization_applied",
+        expr("sparkPlanInfo like '%skew%'")
+    )
+
+queries = queries.join(
+    skew_join_flag.select("executionId", "skew_join_optimization_applied"),
+    "executionId",
+    "left"
+).fillna({"skew_join_optimization_applied": False})
+
+# ==========================================================
+# STAGE DATA
+# ==========================================================
+
+stages = raw.filter(col("Event") == "SparkListenerStageCompleted") \
+    .select(
+        col("Stage Info.Stage ID").alias("stage_id"),
+        col("Stage Info.Parent IDs").alias("parents"),
+        col("Stage Info.Submission Time").alias("start_time"),
+        col("Stage Info.Completion Time").alias("end_time")
+    ) \
+    .withColumn("stage_duration", col("end_time") - col("start_time"))
+
+# ==========================================================
+# REAL DAG CRITICAL PATH (Longest Path)
+# ==========================================================
+
+stage_df = stages.collect()
+
+stage_dict = {}
+for row in stage_df:
+    stage_dict[row.stage_id] = {
+        "duration": row.stage_duration,
+        "parents": row.parents if row.parents else []
+    }
+
+memo = {}
+
+def dfs(stage_id):
+    if stage_id in memo:
+        return memo[stage_id]
+    parents = stage_dict[stage_id]["parents"]
+    if not parents:
+        memo[stage_id] = stage_dict[stage_id]["duration"]
+    else:
+        memo[stage_id] = stage_dict[stage_id]["duration"] + \
+            max([dfs(p) for p in parents])
+    return memo[stage_id]
+
+critical_path_time = 0
+for sid in stage_dict:
+    critical_path_time = max(critical_path_time, dfs(sid))
+
+critical_path_df = spark.createDataFrame(
+    [(critical_path_time,)],
+    ["critical_path_stage_time"]
+)
+
+queries = queries.crossJoin(critical_path_df)
+
+# ==========================================================
+# CARDINALITY ESTIMATION EXTRACTION
+# ==========================================================
+
+plan_nodes = sql_start.selectExpr("executionId", "explode(sparkPlanInfo.children) as node")
+
+cardinality = plan_nodes.select(
+    "executionId",
+    col("node.nodeName").alias("node_name"),
+    col("node.statistics.rowCount").alias("estimated_rows")
+)
+
+task_output = raw.filter(col("Event") == "SparkListenerTaskEnd") \
+    .groupBy() \
+    .agg(sum("Task Metrics.Output Metrics.Records Written")
+         .alias("actual_output_rows"))
+
+cardinality = cardinality.crossJoin(task_output)
+
+cardinality = cardinality.withColumn(
+    "cardinality_error_ratio",
+    col("actual_output_rows") / (col("estimated_rows") + lit(1))
+)
+
+cardinality = cardinality.withColumn(
+    "statistics_issue_flag",
+    when(col("cardinality_error_ratio") > 10, True).otherwise(False)
+)
+
+# ==========================================================
+# FINAL FEATURE TABLE
+# ==========================================================
+
+final_df = queries.join(
+    cardinality.select("executionId", "cardinality_error_ratio",
+                       "statistics_issue_flag"),
+    "executionId",
+    "left"
+)
+
+final_df.show(truncate=False)
+
+final_df.write.mode("overwrite").parquet("enterprise_query_features")
+
+spark.stop()
