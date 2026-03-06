@@ -78,7 +78,7 @@ def load_config(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
-    required = ["instance_code", "env_code", "raw_id_start", "curated_id_start"]
+    required = ["instance_code", "env_code"]
     missing = [k for k in required if k not in cfg]
     if missing:
         raise ValueError(f"config.yaml missing required keys: {missing}")
@@ -204,6 +204,21 @@ def parse_old_name(name: str) -> dict:
     if not tokens or not tokens[0]:
         return result
 
+    # ── Strip leading P_ / PR_ / P- placeholders ──
+    t0 = tokens[0].upper()
+    if t0 in {"P", "PR"}:
+        # e.g. "P_FCTDS_D_..." or "PR_FCTDS_D_..." → drop the placeholder token
+        tokens = tokens[1:]
+        if not tokens:
+            return result
+    elif t0.startswith("P-"):
+        # e.g. "P-FCTDS_D_..." → strip the two-char prefix
+        tokens[0] = tokens[0][2:]
+        if not tokens[0]:
+            tokens = tokens[1:]
+            if not tokens:
+                return result
+
     result["app_prefix"] = tokens[0].upper()
 
     if len(tokens) < 2:
@@ -256,7 +271,9 @@ def _pattern_candidates(pattern: str) -> set:
     return set(found)
 
 
-def lookup_subject_area(job_name: str, maps: dict, app_code: str = "") -> tuple:
+def lookup_subject_area(
+    job_name: str, maps: dict, app_code: str = "", freq_map: dict = None
+) -> tuple:
     """
     Find subject area for a job name using four-tier matching:
       1. Exact match
@@ -285,35 +302,55 @@ def lookup_subject_area(job_name: str, maps: dict, app_code: str = "") -> tuple:
 
     # Tier 4 — dynamic derivation from name tokens; skip resolved app_code
     extra = {re.sub(r"[^A-Z0-9]", "", app_code.upper())} if app_code else set()
-    subject_code, category, candidates = derive_subject_from_name(job_name, extra_skip=extra)
+    subject_code, category, candidates = derive_subject_from_name(
+        job_name, extra_skip=extra, freq_map=freq_map
+    )
     return subject_code, category, candidates, True
 
 
-def derive_subject_from_name(job_name: str, extra_skip: set = None) -> tuple:
+def derive_subject_from_name(
+    job_name: str,
+    extra_skip: set = None,
+    freq_map: dict = None,
+) -> tuple:
     """
     Dynamically derive a subject code from job name tokens.
 
     Algorithm:
       - Tokenise on '_', upper-case and strip non-alphanumeric per token
       - Skip token[0] (app prefix — always)
-      - Walk remaining tokens; skip if token is in SCHEDULE_TOKENS,
-        NOISE_TOKENS, or has fewer than 3 alphanumeric characters
+      - Walk remaining tokens; skip if in SCHEDULE_TOKENS, NOISE_TOKENS,
+        extra_skip, or fewer than 3 alphanumeric characters
       - Collect first 2 meaningful candidates
-      - subject_code = first 6 chars of (candidate1 + candidate2),
-        right-padded with 'X' to exactly 6 characters
-      - category = "raw" if the literal token "RAW" appears in the split,
-        otherwise "curated"
+      - If freq_map supplied and (cand[0], cand[1]) appears in ≥3 jobs:
+          subject_code = (cand[0] + cand[1])[:6]  — use both tokens
+        Else:
+          subject_code = cand[0][:6]               — use first token only
+      - Right-pad to exactly 6 chars with 'X'
+      - category = "raw" if literal "RAW" token present, else "curated"
 
-    Returns (subject_code: str, category: str, candidates: set).
-    candidates is the set of token strings that were used to build the
-    subject_code — callers use this to strip them from the suffix.
+    Returns (subject_code: str, category: str, strip_candidates: set).
+    strip_candidates contains only tokens actually used in building subject_code
+    (primary always; secondary only if fully consumed within 6-char budget).
     """
     raw_tokens = job_name.strip().split("_")
-    category = "raw" if "RAW" in [t.upper() for t in raw_tokens] else "curated"
+    _toks = {t.upper() for t in raw_tokens}
+    if _toks & {"RAW", "SAN", "SANITIZED"}:
+        category = "raw"
+    elif _toks & {"CONF", "CONFORMED"}:
+        category = "conformed"
+    elif _toks & {"CURATED", "FFP"}:
+        category = "curated"
+    elif _toks & {"KAFKA", "API", "STREAMING"}:
+        category = "streaming"
+    elif "NDM" in _toks:
+        category = "ndm"
+    else:
+        category = "other"
 
     skip = extra_skip or set()
     candidates: list = []
-    for tok in raw_tokens[1:]:          # skip app prefix (token[0])
+    for tok in raw_tokens[1:]:
         clean = re.sub(r"[^A-Z0-9]", "", tok.upper())
         if not clean:
             continue
@@ -325,40 +362,113 @@ def derive_subject_from_name(job_name: str, extra_skip: set = None) -> tuple:
         if len(candidates) == 2:
             break
 
-    combined = "".join(candidates)[:6]
+    # Frequency-based decision: use 2-token pair only if it appears in ≥3 jobs
+    freq_map = freq_map or {}
+    use_pair = (
+        len(candidates) == 2
+        and freq_map.get((candidates[0], candidates[1]), 0) >= 3
+        and len(candidates[0]) + len(candidates[1]) <= 6   # both tokens must fit whole
+    )
+
+    if use_pair:
+        combined = candidates[0] + candidates[1]           # no truncation — guaranteed ≤6
+        active_candidates = candidates[:2]
+    elif candidates:
+        combined = candidates[0][:6]                       # single token, pad if shorter
+        active_candidates = candidates[:1]
+    else:
+        combined = ""
+        active_candidates = []
+
     subject_code = combined.ljust(6, "X") if combined else "UNKNWX"
-    return subject_code, category, set(candidates)
+
+    # Strip only candidates fully consumed by the 6-char budget
+    strip_candidates: set = set()
+    chars_used = 0
+    for i, cand in enumerate(active_candidates):
+        if i == 0:
+            strip_candidates.add(cand)
+            chars_used += min(len(cand), 6)
+        elif chars_used + len(cand) <= 6:
+            strip_candidates.add(cand)
+            chars_used += len(cand)
+        else:
+            break
+
+    return subject_code, category, strip_candidates
+
+
+def build_token_pair_freq(df: pd.DataFrame) -> dict:
+    """
+    Pre-scan all job names to count frequency of (token_a, token_b) pairs.
+
+    For each job name: skip token[0] (app prefix) and walk remaining tokens
+    using the same SCHEDULE_TOKENS / NOISE_TOKENS / len<3 skip rules.
+    Collect the first two meaningful candidates; if two exist, increment
+    the counter for that pair.
+
+    Returns {(token_a, token_b): count} dict.
+    """
+    from collections import Counter
+    freq: Counter = Counter()
+    for _, row in df.iterrows():
+        job_name = str(row.get("job_name", "")).strip()
+        if not job_name:
+            continue
+        raw_tokens = job_name.strip().split("_")
+        cands: list = []
+        for tok in raw_tokens[1:]:
+            clean = re.sub(r"[^A-Z0-9]", "", tok.upper())
+            if not clean:
+                continue
+            if clean in SCHEDULE_TOKENS or clean in NOISE_TOKENS:
+                continue
+            if len(clean) < 3:
+                continue
+            cands.append(clean)
+            if len(cands) == 2:
+                break
+        if len(cands) == 2 and len(cands[0]) + len(cands[1]) <= 6:
+            freq[(cands[0], cands[1])] += 1
+    return dict(freq)
 
 
 # ── ID Counter ─────────────────────────────────────────────────────────────────
+
+_CATEGORY_ID_START = {
+    "raw":       1000,
+    "conformed": 2000,
+    "curated":   3000,
+    "streaming": 4000,
+    "ndm":       5000,
+    "other":     6000,
+}
+
 
 class IDCounter:
     """
     Sequential unique-ID generator per (subject_code, category) pair.
 
-    RAW jobs start at raw_start (default 1000).
-    Curated/Conformed jobs start at curated_start (default 3000).
-    Each counter increments independently per subject area.
+    Category → ID range start:
+      raw        → 1000  (RAW, SAN, SANITIZED)
+      conformed  → 2000  (CONF, CONFORMED)
+      curated    → 3000  (CURATED, FFP)
+      streaming  → 4000  (KAFKA, API, STREAMING)
+      ndm        → 5000  (NDM)
+      other      → 6000  (fallback)
     """
 
-    def __init__(self, raw_start: int = 1000, curated_start: int = 3000):
-        self._raw_start = raw_start
-        self._curated_start = curated_start
-        self._raw: dict = {}
-        self._curated: dict = {}
+    def __init__(self):
+        self._counters: dict = {}
 
     def next(self, subject_code: str, category: str) -> int:
-        key = subject_code.upper()
-        if category.lower() == "raw":
-            if key not in self._raw:
-                self._raw[key] = self._raw_start
-            val = self._raw[key]
-            self._raw[key] += 1
-        else:
-            if key not in self._curated:
-                self._curated[key] = self._curated_start
-            val = self._curated[key]
-            self._curated[key] += 1
+        cat = category.lower()
+        start = _CATEGORY_ID_START.get(cat, _CATEGORY_ID_START["other"])
+        key = (subject_code.upper(), cat)
+        if key not in self._counters:
+            self._counters[key] = start
+        val = self._counters[key]
+        self._counters[key] += 1
         return val
 
 
@@ -372,6 +482,7 @@ def resolve_fields(
     cfg: dict,
     id_counter: IDCounter,
     application_name: str = "",
+    freq_map: dict = None,
 ) -> dict:
     """
     Map parsed tokens → final field values using config and mapping tables.
@@ -389,25 +500,15 @@ def resolve_fields(
     is_exception = False
     needs_review = False
 
-    # ── App code ──
-    app_prefix = parsed["app_prefix"]
-    app_code = maps["app"].get(app_prefix.upper(), "")
-    if not app_code:
-        # Fallback: normalise application_name to a 5-char app code
-        fallback = re.sub(r"[^A-Z0-9]", "", application_name.upper())[:5].ljust(5, "X")
-        if fallback.strip("X"):  # non-empty meaningful content
-            app_code = fallback
-            needs_review = True
-            notes.append(
-                f"app prefix '{app_prefix}' not in app_codes.csv; "
-                f"using application_name '{application_name}' -> {app_code}"
-            )
-        else:
-            is_exception = True
-            app_code = (app_prefix + "XXXXX")[:5].upper()
-            notes.append(
-                f"Unknown app prefix '{app_prefix}' — add to mappings/app_codes.csv"
-            )
+    # ── App code — taken directly from application_name column ──
+    app_code = re.sub(r"[^A-Z0-9]", "", application_name.upper())[:5].ljust(5, "X")
+    if not app_code.strip("X"):
+        is_exception = True
+        app_code = (re.sub(r"[^A-Z0-9]", "", parsed["app_prefix"].upper()) + "XXXXX")[:5]
+        notes.append(
+            f"application_name '{application_name}' is empty or invalid — "
+            "populate application_name in the source data"
+        )
 
     # ── Instance & Env — always from config ──
     instance = str(cfg["instance_code"]).strip().upper()
@@ -437,13 +538,21 @@ def resolve_fields(
 
     # ── Subject area ──
     subject_code, category, subj_candidates, subj_auto_derived = lookup_subject_area(
-        job_name, maps, app_code
+        job_name, maps, app_code, freq_map=freq_map
     )
     if subj_auto_derived:   # True only for Tier-4; CSV-matched tiers return False
         needs_review = True
         notes.append(
             "Subject area auto-derived from job name tokens; "
             "verify in subject_areas.csv"
+        )
+
+    # ── Guard: subject_code must not echo app_code ──
+    if subject_code[:5] == app_code:
+        needs_review = True
+        notes.append(
+            f"subject_code '{subject_code}' echoes app_code '{app_code}' — "
+            "add a subject_areas.csv rule to assign a distinct subject"
         )
 
     # ── ETL type (from old name's trailing type token) ──
@@ -466,8 +575,18 @@ def resolve_fields(
     # ── Unique ID ──
     job_id = id_counter.next(subject_code, category)
 
-    # ── Suffix body — remove subject-area tokens to avoid repetition ──
+    # ── Suffix body — remove app_code token if present (already in name header) ──
     suffix_body = parsed["suffix_body"]
+    app_clean = re.sub(r"[^A-Z0-9]", "", app_code.upper())
+    kept = []
+    for part in suffix_body.split("_"):
+        if re.sub(r"[^A-Z0-9]", "", part.upper()) == app_clean:
+            pass   # already encoded in app segment of new name
+        else:
+            kept.append(part)
+    suffix_body = "_".join(kept)
+
+    # ── Suffix body — remove subject-area tokens to avoid repetition ──
     if subj_candidates:
         remaining = set(subj_candidates)   # each candidate removed at most once
         kept = []
@@ -478,6 +597,27 @@ def resolve_fields(
             else:
                 kept.append(part)
         suffix_body = "_".join(kept)
+
+    # ── Suffix body — remove category-indicator tokens (already encoded in job_id) ──
+    CATEGORY_STRIP = {
+        "RAW", "SAN", "SANITIZED",
+        "CONF", "CONFORMED",
+        "CURATED", "FFP",
+        "KAFKA", "API", "STREAMING",
+        "NDM",
+    }
+    kept = []
+    for part in suffix_body.split("_"):
+        if re.sub(r"[^A-Z0-9]", "", part.upper()) not in CATEGORY_STRIP:
+            kept.append(part)
+    suffix_body = "_".join(kept)
+
+    # ── Suffix body — replace LOAD → LD ──
+    suffix_body = re.sub(r'\bLOAD\b', 'LD', suffix_body, flags=re.IGNORECASE)
+
+    # ── Suffix body — remove single-letter tokens ──
+    kept = [p for p in suffix_body.split("_") if len(re.sub(r"[^A-Z0-9]", "", p.upper())) > 1]
+    suffix_body = "_".join(kept)
 
     # ── Suffix body — truncate if over limit ──
     if len(suffix_body) > MAX_SUFFIX_LEN:
@@ -619,10 +759,8 @@ def process_all(df: pd.DataFrame, maps: dict, cfg: dict) -> pd.DataFrame:
     Returns output DataFrame with old_name, new_name, status, notes, and all
     per-field columns for audit.
     """
-    id_counter = IDCounter(
-        raw_start=int(cfg.get("raw_id_start", 1000)),
-        curated_start=int(cfg.get("curated_id_start", 3000)),
-    )
+    id_counter = IDCounter()
+    freq_map = build_token_pair_freq(df)
 
     rows = []
     for _, row in df.iterrows():
@@ -632,7 +770,8 @@ def process_all(df: pd.DataFrame, maps: dict, cfg: dict) -> pd.DataFrame:
 
         parsed = parse_old_name(job_name)
         fields = resolve_fields(
-            parsed, job_name, job_type, maps, cfg, id_counter, application_name
+            parsed, job_name, job_type, maps, cfg, id_counter,
+            application_name, freq_map=freq_map
         )
         new_name = build_new_name(fields)
         violations = validate_new_name(new_name, fields)
@@ -710,8 +849,7 @@ def main() -> None:
     cfg = load_config(config_path)
     print(f"  instance_code:  {cfg['instance_code']}")
     print(f"  env_code:       {cfg['env_code']}")
-    print(f"  raw_id_start:   {cfg['raw_id_start']}")
-    print(f"  curated_id_start: {cfg['curated_id_start']}")
+    print(f"  ID ranges: raw=1000 conformed=2000 curated=3000 streaming=4000 ndm=5000 other=6000")
 
     # Mappings
     print("\nLoading mappings...")
