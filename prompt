@@ -1,0 +1,479 @@
+Act as a Principal AI Architect and Senior Data Engineer.
+
+Build a production-grade Multi-Agent RAG application for Spark ETL JSON configuration files.
+
+Background
+----------
+Our organization executes Spark jobs using spark-submit.
+
+Each Spark job is controlled by one or more JSON configuration files.
+
+The JSON contains:
+
+- Application information
+- Multiple flows
+- SQL queries
+- Source tables
+- Target tables
+- Intermediate DataFrames
+- registerName
+- storageName
+- saveOutput
+- flowId
+- seqDependencies
+- DQ checks
+- Validation checks
+- SourceQuery
+- TargetQuery
+- Email alerts
+- Hive partitions
+- Parameters
+- Runtime variables
+
+Example lineage
+
+Source Table
+↓
+
+Spark SQL
+
+↓
+
+registerName = raw_df
+
+↓
+
+Another Spark SQL
+
+↓
+
+Target Table
+
+Current Problem
+----------------
+
+A normal RAG converts JSON into English.
+
+This loses technical relationships.
+
+The LLM cannot correctly answer
+
+- Which tables feed table X?
+- Which DataFrame was created from table Y?
+- What is the complete lineage?
+- What DQ checks exist?
+- Which flow produces this table?
+
+Instead of document RAG, I need Graph-aware Multi-Agent RAG.
+
+Architecture
+----------------
+
+Build the following agents.
+
+Agent 1
+Configuration Parser Agent
+
+Responsibilities
+
+- Read JSON
+- Validate schema
+- Parse all objects
+- Parse flows
+- Parse SQL
+- Parse DQ checks
+- Parse runtime variables
+- Parse dependencies
+
+Output
+
+Structured metadata
+
+
+--------------------------------------
+
+Agent 2
+SQL Lineage Agent
+
+Use SQLGlot.
+
+Extract
+
+- Source tables
+- Target tables
+- Columns
+- Joins
+- Filters
+- Aggregations
+- Window functions
+- CTEs
+- Aliases
+
+Return structured lineage.
+
+
+--------------------------------------
+
+Agent 3
+DataFrame Resolution Agent
+
+Resolve
+
+registerName
+
+storageName
+
+saveOutput
+
+temporary dataframe
+
+persistent dataframe
+
+Map
+
+table
+↓
+
+dataframe
+↓
+
+dataframe
+↓
+
+table
+
+Return dataframe lineage graph.
+
+
+--------------------------------------
+
+Agent 4
+Flow Dependency Agent
+
+Use flowId
+
+seqDependencies
+
+Build DAG.
+
+Return execution graph.
+
+Example
+
+Flow1
+
+↓
+
+Flow2
+
+↓
+
+Flow5
+
+↓
+
+Flow7
+
+
+--------------------------------------
+
+Agent 5
+Knowledge Graph Agent
+
+Build a graph.
+
+Node types
+
+Application
+
+Flow
+
+Table
+
+Column
+
+DataFrame
+
+SQL
+
+DQ Check
+
+Validation
+
+Edges
+
+READS_FROM
+
+WRITES_TO
+
+CREATES
+
+USES
+
+DEPENDS_ON
+
+VALIDATES
+
+CHECKS
+
+SAVE_AS
+
+STORES
+
+Use NetworkX.
+
+Export GraphML.
+
+--------------------------------------
+
+Agent 6
+Embedding Agent
+
+Generate embeddings for
+
+Entire pipeline
+
+Each flow
+
+Each SQL
+
+Each table
+
+Each dataframe
+
+Each DQ rule
+
+Store in ChromaDB.
+
+Metadata should include
+
+application
+
+flowId
+
+source tables
+
+target tables
+
+dataframes
+
+pipeline
+
+tags
+
+--------------------------------------
+
+Agent 7
+Retriever Agent
+
+Hybrid Retrieval
+
+Vector Search
+
++
+
+Knowledge Graph traversal
+
++
+
+Metadata filtering
+
+Return top K context.
+
+--------------------------------------
+
+Agent 8
+Reasoning Agent
+
+Use GPT-5.
+
+Answer questions like
+
+What is the lineage?
+
+Which table feeds this table?
+
+Explain this pipeline.
+
+Where is this dataframe created?
+
+Which DQ checks validate this table?
+
+Which flow loads this table?
+
+Explain SQL.
+
+Explain transformations.
+
+--------------------------------------
+
+Agent 9
+Feedback Agent
+
+Evaluate answer quality.
+
+Check hallucination.
+
+Verify lineage exists.
+
+Re-query if confidence is low.
+
+--------------------------------------
+
+Agent 10
+Visualization Agent
+
+Generate
+
+Lineage graph
+
+Flow graph
+
+DAG
+
+Mermaid diagram
+
+Graphviz
+
+Interactive HTML
+
+--------------------------------------
+
+Project Structure
+
+Use Python.
+
+Directory
+
+src/
+
+agents/
+
+config_parser.py
+
+sql_lineage.py
+
+dataframe_agent.py
+
+flow_agent.py
+
+graph_agent.py
+
+embedding_agent.py
+
+retriever_agent.py
+
+reasoning_agent.py
+
+feedback_agent.py
+
+visualization_agent.py
+
+models/
+
+graph/
+
+database/
+
+utils/
+
+api/
+
+streamlit/
+
+tests/
+
+Use
+
+LangGraph
+
+LangChain
+
+SQLGlot
+
+NetworkX
+
+ChromaDB
+
+SQLite
+
+Pydantic
+
+FastAPI
+
+Streamlit
+
+SentenceTransformers
+
+OpenAI GPT-5
+
+Logging
+
+Retry
+
+Caching
+
+Configuration
+
+Requirements
+
+Use async where appropriate.
+
+Use type hints.
+
+Use Pydantic models.
+
+Write modular code.
+
+Add unit tests.
+
+Generate README.
+
+Generate architecture diagram.
+
+Generate sequence diagram.
+
+Generate sample JSON.
+
+Generate sample lineage graph.
+
+Generate sample questions.
+
+Design should support thousands of Spark pipelines.
+
+------------------------------------------------------------------------------------------------
+Implement ConfigParserAgent.
+
+Requirements
+
+Read JSON.
+
+Create Pydantic models.
+
+Parse
+
+Application
+
+Flows
+
+Queries
+
+DQ checks
+
+Checks
+
+Dependencies
+
+registerName
+
+storageName
+
+Return ParsedPipeline object.
+
+Add logging.
+
+Add unit tests.
+
+Return strongly typed objects.
+
+Do not generate placeholder code.
